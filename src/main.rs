@@ -2,17 +2,24 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph};
-use ratatui::{DefaultTerminal, Frame};
-use std::fmt::format;
+use ratatui::widgets::{Block, BorderType, Gauge, LineGauge, Paragraph, Sparkline};
+use ratatui::{DefaultTerminal, Frame, symbols};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
+use sysinfo::{Disk, Disks, MINIMUM_CPU_UPDATE_INTERVAL, System};
 
 const TICK_RATE: Duration = Duration::from_millis(500); // half a second
 const MUTED: Color = Color::DarkGray;
 const ACCENT: Color = Color::Red;
+const HISTORY_LEN: usize = 120;
 
 struct App {
     running: bool,
+    system: System,
+    disks: Disks,
+    host_name: String,
+    os_name: String,
+    cpu_history: VecDeque<f64>,
 }
 
 fn main() -> std::io::Result<()> {
@@ -21,7 +28,18 @@ fn main() -> std::io::Result<()> {
 
 impl App {
     fn new() -> Self {
-        Self { running: true }
+        let mut system = System::new_all().expect("failed to read sys info");
+        std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
+        let mut app = Self {
+            running: true,
+            system: system,
+            disks: Disks::new_with_refreshed_list().expect("failed to read disks"),
+            host_name: System::host_name().unwrap_or_else(|_| "unknown".into()),
+            os_name: System::long_os_version().unwrap_or_else(|_| "unknown OS".into()),
+            cpu_history: VecDeque::with_capacity(HISTORY_LEN),
+        };
+        app.on_tick();
+        app
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
@@ -56,12 +74,20 @@ impl App {
         }
     }
 
-    fn on_tick(&mut self) {}
+    fn on_tick(&mut self) {
+        self.system.refresh_cpu_usage();
+        self.system.refresh_memory();
+        self.disks.refresh(true);
+        push_history(&mut self.cpu_history, self.system.global_cpu_usage() as f64);
+    }
 
     fn render(&mut self, frame: &mut Frame) {
+        let core_rows = self.system.cpus().len().div_ceil(2) as u16;
+        let top_height = (core_rows + 3).max(5) + 2;
+
         let [header, top, history, procceses, footer] = Layout::vertical([
             Constraint::Length(3),
-            Constraint::Length(10),
+            Constraint::Length(top_height),
             Constraint::Length(10),
             Constraint::Fill(1),
             Constraint::Length(1),
@@ -72,22 +98,25 @@ impl App {
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(top);
 
         self.render_header(frame, header);
-        frame.render_widget(panel("CPU"), cpu);
-        frame.render_widget(panel("Memory"), memory);
+        self.render_cpu(frame, cpu);
+        self.render_memory(frame, memory);
         frame.render_widget(panel("History"), history);
         frame.render_widget(panel("Procceses"), procceses);
         self.render_footer(frame, footer);
     }
 
-    fn render_header(&mut self, frame: &mut Frame, area: Rect){
+    fn render_header(&mut self, frame: &mut Frame, area: Rect) {
         let sep = Span::styled(" | ", MUTED);
+        let uptime = System::uptime().unwrap_or(0);
         let line = Line::from(vec![
             "Goob's System Monitor".bold().fg(ACCENT),
-            sep,
-            Span::raw("live system monitor")
+            sep.clone(),
+            self.host_name.clone().bold(),
+            sep.clone(),
+            Span::raw(format!("up {}h {}m", uptime / 3600, uptime % 3600 / 60)),
         ]);
 
-        let block =  Block::bordered()
+        let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(MUTED);
 
@@ -98,16 +127,86 @@ impl App {
         let key = |k: &'static str, desc: &'static str| {
             [
                 Span::styled(format!(" {k} "), Style::new().fg(Color::Black).bg(ACCENT)),
-                Span::styled(format!(" {desc}\t"), MUTED)
+                Span::styled(format!(" {desc}\t"), MUTED),
             ]
         };
 
-        let spans: Vec<Span> = [
-            key("q", "quit")
-        ]
-            .into_iter().flatten().collect();
+        let spans: Vec<Span> = [key("q", "quit")].into_iter().flatten().collect();
 
         frame.render_widget(Line::from(spans), area);
+    }
+
+    fn render_cpu(&mut self, frame: &mut Frame, area: Rect) {
+        let average = self.system.global_cpu_usage();
+
+        let block = panel(&format!("CPU {average:.0}%"));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let core_rows = self.system.cpus().len().div_ceil(2) as u16;
+
+        let [cores_area, spark_area] =
+            Layout::vertical([Constraint::Length(core_rows), Constraint::Fill(1)])
+                .spacing(2)
+                .areas(inner);
+
+        let [left, right] = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)])
+            .spacing(2)
+            .areas(cores_area);
+
+        for (i, cpu) in self.system.cpus().iter().enumerate() {
+            let usage = cpu.usage() as f64;
+            let column = if i % 2 == 0 { left } else { right };
+            let row = Rect {
+                y: column.y + (i / 2) as u16,
+                height: 1,
+                ..column
+            };
+
+            let gauge = LineGauge::default()
+                .ratio((usage / 100.0).clamp(0.0, 1.0))
+                .label(format!("{i:>2} {usage:>3.0}%"))
+                .filled_symbol(symbols::block::FULL)
+                .unfilled_symbol("░")
+                .filled_style(level_color(usage))
+                .unfilled_style(MUTED);
+
+            frame.render_widget(gauge, row);
+        }
+
+        let width = spark_area.width as usize;
+        let skip = self.cpu_history.len().saturating_sub(width);
+
+        let data: Vec<u64> = self
+            .cpu_history
+            .iter()
+            .skip(skip)
+            .map(|v| *v as u64)
+            .collect();
+
+        let sparkline = Sparkline::default().data(&data).max(100).style(ACCENT);
+        frame.render_widget(sparkline, spark_area);
+    }
+
+    fn render_memory(&mut self, frame: &mut Frame, area: Rect) {
+        let block = panel("Memory");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let [ram_area, swap_area, disk_area] = Layout::vertical(
+            [Constraint::Length(1); 3]
+        ).spacing(1).areas(inner);
+
+        let sys = &self.system;
+        frame.render_widget(used_gauge("RAM", sys.used_memory(), sys.total_memory()), ram_area);
+        frame.render_widget(used_gauge("SWAP", sys.used_swap(), sys.total_swap()), swap_area);
+        
+        if let Some(disk) =  self.disks.first() {
+            let total = disk.total_space();
+            let used = total - disk.available_space();
+            let label = format!("Disk {}", disk.mount_point().display());
+            frame.render_widget(used_gauge(&label, used, total), disk_area);
+        }
     }
 }
 
@@ -116,4 +215,45 @@ fn panel(title: &str) -> Block<'static> {
         .border_type(BorderType::Rounded)
         .border_style(MUTED)
         .title(Line::from(format!(" {title} ")).fg(ACCENT).bold())
+}
+
+fn level_color(percent: f64) -> Color {
+    if percent < 50.0 {
+        Color::Green
+    } else if percent < 80.0 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
+fn percent(used: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        used as f64 / total as f64 * 100.0
+    }
+}
+
+fn used_gauge(name: &str, used: u64, total: u64) -> Gauge<'static> {
+    let pct = percent(used, total);
+    let gb = |bytes: u64| bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+
+    Gauge::default()
+        .ratio(pct / 100.0)
+        .label(format!(
+            "{name} {:.1} / {:.1} GB ({pct:.0}%",
+            gb(used),
+            gb(total)
+        ))
+        .gauge_style(Style::new().fg(level_color(pct)).bg(Color::Black))
+        .use_unicode(true)
+}
+
+fn push_history(history: &mut VecDeque<f64>, value: f64) {
+    history.push_back(value);
+
+    if history.len() > HISTORY_LEN {
+        history.pop_front();
+    }
 }
